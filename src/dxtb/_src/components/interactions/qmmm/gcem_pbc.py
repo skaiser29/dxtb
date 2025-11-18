@@ -149,10 +149,13 @@ class GCEMPBC(Interaction):
         "Ls",
         "independent_params",
         "ewald_precision",
+        "electrostatics_dtype",
+        "_edd",
+        "_scf_dtype",
     ]
 
     def __init__(
-        self, 
+        self,
         hubbard: Tensor,
         lhubbard: Tensor,
         diphubbard: Tensor | None,
@@ -163,23 +166,35 @@ class GCEMPBC(Interaction):
         rcut_ewald: torch.double,
         average: AveragingFunction = harmonic_average,
         device = None,
-        dtype = None,
+        dtype: torch.dtype | None = None,
+        electrostatics_dtype: torch.dtype | None = None,
         independent_params: bool = False,
         ewald_precision: float = 1e-6,
         ):
-        super().__init__(device, dtype)
+        scf_dtype = dtype if dtype is not None else get_default_dtype()
+        super().__init__(device, scf_dtype)
 
-        self.hubbard = hubbard.to(**self.dd)
-        self.lhubbard = lhubbard if lhubbard is None else lhubbard.to(**self.dd)
+        self._scf_dtype = scf_dtype
+        self.electrostatics_dtype = (
+            electrostatics_dtype
+            if electrostatics_dtype is not None
+            else self._scf_dtype
+        )
+        self._edd: DD = {"device": self.device, "dtype": self.electrostatics_dtype}
+
+        self.hubbard = hubbard.to(**self._edd)
+        self.lhubbard = (
+            None if lhubbard is None else lhubbard.to(**self._edd)
+        )
         if diphubbard is not None:
-            self.diphubbard = diphubbard.to(**self.dd)
+            self.diphubbard = diphubbard.to(**self._edd)
         else:
             self.diphubbard = None
-        self.mm_charges = mm_charges.to(**self.dd)
-        self.mm_coords = mm_coords.to(**self.dd)
-        self.mm_hubbard = mm_hubbard.to(**self.dd)
-        self.box = box.to(**self.dd)
-        self.rcut_ewald = rcut_ewald
+        self.mm_charges = mm_charges.to(**self._edd)
+        self.mm_coords = mm_coords.to(**self._edd)
+        self.mm_hubbard = mm_hubbard.to(**self._edd)
+        self.box = box.to(**self._edd)
+        self.rcut_ewald = torch.as_tensor(rcut_ewald, **self._edd)
         self.ewald_precision = ewald_precision
         self.setup_ewald_params()
         self.average = average
@@ -190,29 +205,35 @@ class GCEMPBC(Interaction):
         return abs(torch.det(self.box))
 
     def get_Gv_weights(self, mesh):
-        dd: DD = {"device": self.device, "dtype": self.dtype}
+        dd: DD = self._edd
         # Default, the 3D uniform grids
         rx = torch.fft.fftfreq(mesh[0], 1./mesh[0], **dd)
         ry = torch.fft.fftfreq(mesh[1], 1./mesh[1], **dd)
         rz = torch.fft.fftfreq(mesh[2], 1./mesh[2], **dd)
-        b = torch.inverse(self.box) * 2 * torch.pi
+        pi = torch.tensor(torch.pi, **dd)
+        b = torch.inverse(self.box) * 2 * pi
 
         Gvbase = (rx, ry, rz)
 
-        Gv = torch.matmul(cartesian_prod(Gvbase), b)
+        Gv = torch.matmul(cartesian_prod(Gvbase, **dd), b)
 
         # 1/cell.vol == det(b)/(2pi)^3
-        weights = abs(torch.det(b)) /(2*torch.pi)**3
+        weights = abs(torch.det(b)) / (2 * pi) ** 3
         return Gv, weights
 
     def get_lattice_Ls(self, rcut):
-        dd: DD = {"device": self.device, "dtype": self.dtype}
-        Tmax = torch.ceil(0.5 * ((4.1888*rcut**3/self.vol)**(1/3)-1)) + 1
+        dd: DD = self._edd
+        Tmax = torch.ceil(
+            0.5 * ((4.1888 * rcut**3 / self.vol) ** (1 / 3) - 1)
+        ) + 1
         if Tmax == 0:
             return torch.zeros((1,3), **dd)
         else:
             return torch.matmul(
-                cartesian_prod([torch.arange(-Tmax,Tmax+1)]*3).to(**dd),
+                cartesian_prod(
+                    [torch.arange(-Tmax,Tmax+1)]*3,
+                    **dd,
+                ),
                 self.box
             )
 
@@ -223,17 +244,25 @@ class GCEMPBC(Interaction):
                 return l(x.cpu().detach().clone())
             else:
                 return l(x.detach().clone())
-        e = precision
-        Q = torch.sum(self.mm_charges**2) + 1000.
+        e = torch.tensor(precision, **self._edd)
+        Q = torch.sum(self.mm_charges**2) + torch.tensor(1000.0, **self._edd)
 #        eta = 1 / rcut * torch.sqrt(lambertw(1/e*torch.sqrt(Q/2/self.vol)).real)
         eta = 1 / rcut * torch.sqrt(
-            1.5 * 
+            1.5 *
             lambertw(
                 2/3 * (4/e*Q/rcut/self.vol)**(2/3) * rcut**2
                 ).real
             )
         L = self.vol**(1/3)
-        kmax = 1.73205081*eta/2/torch.pi * torch.sqrt(lambertw( 4*Q**(2/3)/3/torch.pi**(2/3)/L**2/eta**(2/3) / e**(4/3) ).real)
+        pi = torch.tensor(torch.pi, **self._edd)
+        kmax = (
+            1.73205081 * eta / (2 * pi)
+            * torch.sqrt(
+                lambertw(
+                    4*Q**(2/3)/3/pi**(2/3)/L**2/eta**(2/3) / e**(4/3)
+                ).real
+            )
+        )
         mesh = torch.ceil(torch.diag(self.box) * kmax).to(torch.int) * 2 + 1
         return eta.to(self.device), mesh.to(self.device)
 
@@ -277,8 +306,10 @@ class GCEMPBC(Interaction):
         # if the cache is built, store the cachvar for validation
         self._cachevars = cachvars
 
+        positions_elec = positions.to(**self._edd)
+
         self.cache = GCEMPBCCache(
-            *self.get_interaction_tensors(positions, ihelp)
+            *self.get_interaction_tensors(positions_elec, ihelp)
         )
 
         return self.cache
@@ -378,14 +409,15 @@ class GCEMPBC(Interaction):
                     torch.special.erf,
                     dist12 * self.eta,
                     use_reentrant=False) / dist12
+            erf_prefactor = torch.tensor(1.1283791670955126, **dd)
             tmp = checkpoint_einsum("ijLx,ijL->ijx", R12,
                     (-checkpoint(
                         torch.special.erf,
                         checkpoint_einsum("ijL,ij->ijL", dist12, avg12d),
                         use_reentrant=False
                                 ) / dist12 + \
-                      1.1283791670955126 * checkpoint_einsum(
-                                              "ijL,ij->ijL", 
+                      erf_prefactor * checkpoint_einsum(
+                                              "ijL,ij->ijL",
                                               checkpoint(
                                                     torch.exp,
                                                     -checkpoint_einsum("ijL,ij->ijL", dist12**2, avg12d**2),
@@ -393,7 +425,7 @@ class GCEMPBC(Interaction):
                                                         ),
                                               avg12d
                                                             ) + \
-                      Tij - 1.1283791670955126 * checkpoint(
+                      Tij - erf_prefactor * checkpoint(
                                                         torch.exp,
                                                         -dist12**2 * self.eta**2,
                                                         use_reentrant=False
@@ -417,8 +449,9 @@ class GCEMPBC(Interaction):
         # Ewald k-space
         Gv, weights = self.get_Gv_weights(self.mesh)
         absG2 = einsum('gx,gx->g', Gv, Gv)
-        absG2 = torch.where(absG2>0.0, absG2, 1e100)
-        coulG = 4*torch.pi / absG2 * weights
+        absG2 = torch.where(absG2>0.0, absG2, torch.tensor(1e100, **dd))
+        pi = torch.tensor(torch.pi, **dd)
+        coulG = 4*pi / absG2 * weights
         Gpref = torch.exp(-absG2/(4*self.eta**2)) * coulG
         GvRmm = checkpoint_einsum('gx,ix->ig', Gv, self.mm_coords)
         cosGvRmm = checkpoint(torch.cos, GvRmm, use_reentrant=False)
@@ -447,9 +480,12 @@ class GCEMPBC(Interaction):
         else:
             dippot_ks = torch.zeros_like(positions)
 
-        return pot_rs + pot_ks, \
-               dippot_rs + dippot_ks, \
-               2 * (mat_rs + mat_ks - mat_us)
+        scf_dtype = self._scf_dtype
+        return (
+            (pot_rs + pot_ks).to(dtype=scf_dtype),
+            (dippot_rs + dippot_ks).to(dtype=scf_dtype),
+            (2 * (mat_rs + mat_ks - mat_us)).to(dtype=scf_dtype),
+        )
 
     @override
     def get_shell_energy(self, charges: Tensor, cache: GCEMPBCCache) -> Tensor:
@@ -467,15 +503,21 @@ class GCEMPBC(Interaction):
     def get_dipole_potential(self, _: Tensor, cache: GCEMPBCCache) -> Tensor:
         return cache.dippot
     
-def cartesian_prod(arrays):
-    arrays = [torch.as_tensor(x) for x in arrays]
-    nd = len(arrays)
-    dims = [nd] + [len(x) for x in arrays]
-    out = torch.zeros(dims, dtype=arrays[0].dtype, device=arrays[0].device)
+def cartesian_prod(arrays, *, device=None, dtype=None):
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    if dtype is not None:
+        kwargs["dtype"] = dtype
+
+    tensors = [torch.as_tensor(x, **kwargs) for x in arrays]
+    nd = len(tensors)
+    dims = [nd] + [len(x) for x in tensors]
+    out = torch.zeros(dims, dtype=tensors[0].dtype, device=tensors[0].device)
     shape = [-1] + [1] * nd
-    for i, arr in enumerate(arrays):
+    for i, arr in enumerate(tensors):
         out[i] = arr.reshape(shape[:nd-i])
-    return out.clone().reshape(nd,-1).T
+    return out.clone().reshape(nd, -1).T
 
 def new_gcempbc(
         numbers: Tensor,
@@ -488,6 +530,7 @@ def new_gcempbc(
         average: AveragingFunction | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        electrostatics_dtype: torch.dtype | None = None,
         independent_params: bool = False,
         ewald_precision: float = 1e-6,
         dipole_coupling: bool = False,
@@ -513,22 +556,20 @@ def new_gcempbc(
         Real-space cutoff for ewald
     ewald_precision: float
         Precision of Ewald
+    device : torch.device | None, optional
+        Device to run the interaction on. Defaults to ``None``.
+    dtype : torch.dtype | None, optional
+        Data type for SCF-facing tensors. Defaults to the global PyTorch
+        default.
+    electrostatics_dtype : torch.dtype | None, optional
+        Data type used internally for the electrostatics tensors. Defaults to
+        ``dtype`` when ``None``.
 
     Returns
     -------
     GCEMPBC | None
         Instance of the GCEMPBC class or ``None`` if no GCEMPBC is used.
     """
-    if type(par) is dict:
-        hubbard = par['hubbard']
-        lhubbard = par['lhubbard']
-        diphubbard = par.get('diphubbard', None)
-        if dipole_coupling:
-            assert diphubbard is not None
-        par = par['xtbpar']
-    if hasattr(par, "charge") is False or par.charge is None:
-        return None
-
     if device is not None:
         if device != numbers.device:
             raise DeviceError(
@@ -536,19 +577,38 @@ def new_gcempbc(
                 f"({numbers.device}) do not match."
             )
 
+    scf_dtype = dtype if dtype is not None else get_default_dtype()
     dd: DD = {
         "device": device,
-        "dtype": dtype if dtype is not None else get_default_dtype(),
+        "dtype": scf_dtype,
     }
+    ed_dtype = (
+        electrostatics_dtype if electrostatics_dtype is not None else scf_dtype
+    )
+    electro_dd: DD = {
+        "device": device,
+        "dtype": ed_dtype,
+    }
+    if type(par) is dict:
+        hubbard = torch.as_tensor(par['hubbard'], **electro_dd)
+        lhubbard = torch.as_tensor(par['lhubbard'], **electro_dd)
+        diphubbard = par.get('diphubbard', None)
+        if diphubbard is not None:
+            diphubbard = torch.as_tensor(diphubbard, **electro_dd)
+        if dipole_coupling:
+            assert diphubbard is not None
+        par = par['xtbpar']
+    if hasattr(par, "charge") is False or par.charge is None:
+        return None
 
     if independent_params:
         pass
     else:
         unique = torch.unique(numbers)
-        hubbard = get_elem_param(unique, par.element, "gam", **dd)
-        lhubbard = get_elem_param(unique, par.element, "lgam", **dd)
+        hubbard = get_elem_param(unique, par.element, "gam", **electro_dd)
+        lhubbard = get_elem_param(unique, par.element, "lgam", **electro_dd)
         if dipole_coupling:
-            diphubbard = get_elem_param(unique, par.element, "gam", **dd)
+            diphubbard = get_elem_param(unique, par.element, "gam", **electro_dd)
         else:
             diphubbard = None
     if average is None:
@@ -561,4 +621,5 @@ def new_gcempbc(
         average,
         independent_params=independent_params,
         ewald_precision=ewald_precision,
+        electrostatics_dtype=ed_dtype,
         **dd)

@@ -99,11 +99,14 @@ class GCEM(Interaction):
         "mm_charges",
         "mm_coords",
         "mm_hubbard",
-        "average"
+        "average",
+        "electrostatics_dtype",
+        "_edd",
+        "_scf_dtype",
     ]
 
     def __init__(
-        self, 
+        self,
         hubbard: Tensor,
         lhubbard: Tensor,
         mm_charges: Tensor,
@@ -111,15 +114,27 @@ class GCEM(Interaction):
         mm_hubbard: Tensor,
         average: AveragingFunction = harmonic_average,
         device = None,
-        dtype = None,
+        dtype: torch.dtype | None = None,
+        electrostatics_dtype: torch.dtype | None = None,
         ):
-        super().__init__(device, dtype)
+        scf_dtype = dtype if dtype is not None else get_default_dtype()
+        super().__init__(device, scf_dtype)
 
-        self.hubbard = hubbard.to(**self.dd)
-        self.lhubbard = lhubbard if lhubbard is None else lhubbard.to(**self.dd)
-        self.mm_charges = mm_charges.to(**self.dd)
-        self.mm_coords = mm_coords.to(**self.dd)
-        self.mm_hubbard = mm_hubbard.to(**self.dd)
+        self._scf_dtype = scf_dtype
+        self.electrostatics_dtype = (
+            electrostatics_dtype
+            if electrostatics_dtype is not None
+            else self._scf_dtype
+        )
+        self._edd: DD = {"device": self.device, "dtype": self.electrostatics_dtype}
+
+        self.hubbard = hubbard.to(**self._edd)
+        self.lhubbard = (
+            None if lhubbard is None else lhubbard.to(**self._edd)
+        )
+        self.mm_charges = mm_charges.to(**self._edd)
+        self.mm_coords = mm_coords.to(**self._edd)
+        self.mm_hubbard = mm_hubbard.to(**self._edd)
         self.average = average
 
     # pylint: disable=unused-argument
@@ -154,8 +169,10 @@ class GCEM(Interaction):
         # if the cache is built, store the cachvar for validation
         self._cachevars = cachvars
 
+        positions_elec = positions.to(**self._edd)
+
         self.cache = GCEMCache(
-            self.get_shell_coulomb_potential(positions, ihelp)
+            self.get_shell_coulomb_potential(positions_elec, ihelp)
         )
 
         return self.cache
@@ -167,7 +184,7 @@ class GCEM(Interaction):
     ) -> Tensor:
         mat = self.get_shell_coulomb_matrix(positions, ihelp)
         pot = einsum('...ik,k->i', mat, self.mm_charges)
-        return pot
+        return pot.to(dtype=self._scf_dtype)
 
     def get_shell_coulomb_matrix(
         self,
@@ -220,7 +237,7 @@ class GCEM(Interaction):
 
     @override
     def get_shell_potential(self, _: Tensor, cache: GCEMCache) -> Tensor:
-        return cache.pot + 0.0
+        return cache.pot
 
 def coulomb_matrix_shell(
     positions: Tensor,
@@ -290,7 +307,8 @@ def new_gcem(
         mm_hubbard: Tensor,
         average: AveragingFunction | None = None,
         device: torch.device | None = None,
-        dtype: torch.dtype | None = None
+        dtype: torch.dtype | None = None,
+        electrostatics_dtype: torch.dtype | None = None,
 ) -> GCEM | None:
     """
     Create new instance of :class:`.GCEM`.
@@ -307,6 +325,14 @@ def new_gcem(
         Cartesian coordinates of all MM charges
     mm_hubbard: Tensor
         Hubbard parameters of each MM charge
+    device : torch.device | None, optional
+        Device to run the interaction on. Defaults to ``None``.
+    dtype : torch.dtype | None, optional
+        Data type for SCF-facing tensors. Defaults to the global PyTorch
+        default.
+    electrostatics_dtype : torch.dtype | None, optional
+        Data type used internally for the electrostatics tensors. Defaults to
+        ``dtype`` when ``None``.
 
     Returns
     -------
@@ -323,18 +349,28 @@ def new_gcem(
                 f"({numbers.device}) do not match."
             )
 
+    scf_dtype = dtype if dtype is not None else get_default_dtype()
     dd: DD = {
         "device": device,
-        "dtype": dtype if dtype is not None else get_default_dtype(),
+        "dtype": scf_dtype,
+    }
+    ed_dtype = (
+        electrostatics_dtype if electrostatics_dtype is not None else scf_dtype
+    )
+    electro_dd: DD = {
+        "device": device,
+        "dtype": ed_dtype,
     }
 
     unique = torch.unique(numbers)
-    hubbard = get_elem_param(unique, par.element, "gam", **dd)
-    lhubbard = get_elem_param(unique, par.element, "lgam", **dd)
+    hubbard = get_elem_param(unique, par.element, "gam", **electro_dd)
+    lhubbard = get_elem_param(unique, par.element, "lgam", **electro_dd)
     if average is None:
         average = averaging_function[par.charge.effective.average]
 
     return GCEM(
         hubbard, lhubbard,
         mm_charges, mm_coords, mm_hubbard,
-        average, **dd)
+        average,
+        electrostatics_dtype=ed_dtype,
+        **dd)
